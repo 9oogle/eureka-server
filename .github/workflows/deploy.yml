@@ -1,0 +1,362 @@
+name: Deploy
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  push:
+    branches: [ "dev", "main" ]
+  workflow_dispatch:
+
+env:
+  IMAGE: ${{ vars.GAR_LOCATION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/${{ vars.SERVICE_NAME }}
+
+jobs:
+  validate:
+    name: Validate Variables
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required variables
+        env:
+          SECRET_VM_HOST: ${{ secrets.VM_HOST }}
+          SECRET_VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          echo "=== Variables ==="
+          echo "GAR_LOCATION      : ${{ vars.GAR_LOCATION }}"
+          echo "GCP_PROJECT_ID    : ${{ vars.GCP_PROJECT_ID }}"
+          echo "GAR_REPOSITORY    : ${{ vars.GAR_REPOSITORY }}"
+          echo "SERVICE_NAME      : ${{ vars.SERVICE_NAME }}"
+          echo "VM_USER           : ${{ vars.VM_USER }}"
+          echo "VM_SSH_PORT       : ${{ vars.VM_SSH_PORT }}"
+          echo "APP_DIR           : ${{ vars.APP_DIR }}"
+          echo ""
+          echo "=== Secrets (존재 여부만 확인) ==="
+          [ -n "$SECRET_VM_HOST"    ] && echo "VM_HOST     : ✅" || echo "VM_HOST     : ❌ 누락"
+          [ -n "$SECRET_VM_SSH_KEY" ] && echo "VM_SSH_KEY  : ✅" || echo "VM_SSH_KEY  : ❌ 누락"
+
+          MISSING=()
+          [ -z "${{ vars.GAR_LOCATION }}"     ] && MISSING+=("vars.GAR_LOCATION")
+          [ -z "${{ vars.GCP_PROJECT_ID }}"   ] && MISSING+=("vars.GCP_PROJECT_ID")
+          [ -z "${{ vars.GAR_REPOSITORY }}"   ] && MISSING+=("vars.GAR_REPOSITORY")
+          [ -z "${{ vars.SERVICE_NAME }}"     ] && MISSING+=("vars.SERVICE_NAME")
+          [ -z "${{ vars.VM_USER }}"          ] && MISSING+=("vars.VM_USER")
+          [ -z "${{ vars.VM_SSH_PORT }}"      ] && MISSING+=("vars.VM_SSH_PORT")
+          [ -z "${{ vars.APP_DIR }}"          ] && MISSING+=("vars.APP_DIR")
+          [ -z "$SECRET_VM_HOST"              ] && MISSING+=("secrets.VM_HOST")
+          [ -z "$SECRET_VM_SSH_KEY"           ] && MISSING+=("secrets.VM_SSH_KEY")
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "=== 누락된 변수 ==="
+            for var in "${MISSING[@]}"; do echo "  ❌ $var"; done
+            exit 1
+          fi
+          echo "=== 모든 변수 확인 완료 ✅ ==="
+
+  test:
+    name: Test
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Run tests
+        run: |
+          chmod +x ./gradlew
+          ./gradlew test \
+            -PGitHubPackagesUsername=${{ github.actor }} \
+            -PGitHubPackagesPassword=${{ secrets.GITHUB_TOKEN }}
+
+  build-and-push:
+    name: Build & Push
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Build JAR
+        run: |
+          chmod +x ./gradlew
+          ./gradlew bootJar -x test \
+            -PGitHubPackagesUsername=${{ github.actor }} \
+            -PGitHubPackagesPassword=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/985172684764/locations/global/workloadIdentityPools/github-pool/providers/github-provider-v2
+          service_account: deployManager@melodic-crane-494802-u3.iam.gserviceaccount.com
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GAR_LOCATION }}-docker.pkg.dev --quiet
+
+      - name: Build and push image
+        run: |
+          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest-${{ github.ref_name }} .
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest-${{ github.ref_name }}
+
+  # dev 브랜치: 단일 VM, local 프로필
+  deploy-dev:
+    name: Deploy (dev)
+    if: github.ref_name != 'main'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy compose file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ vars.VM_USER }}
+          port: ${{ vars.VM_SSH_PORT }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: "docker-compose.dev.yml"
+          target: "${{ vars.APP_DIR }}"
+
+      - name: Deploy to VM
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ vars.VM_USER }}
+          port: ${{ vars.VM_SSH_PORT }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -e
+            APP_DIR="${{ vars.APP_DIR }}"
+            SERVICE="${{ vars.SERVICE_NAME }}"
+            NEW_TAG="${{ github.sha }}"
+            ENV_FILE="$APP_DIR/.env"
+
+            cd $APP_DIR
+
+            PREV_TAG=$(grep '^IMAGE_TAG=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)
+            if [ -z "$PREV_TAG" ]; then
+              echo "이전 태그 없음 — 초기 배포로 간주, 실패 시 롤백 불가"
+            fi
+            echo "Previous: ${PREV_TAG:-(없음)} → New: $NEW_TAG"
+
+            upsert_env() {
+              local KEY="$1" VAL="$2"
+              if grep -q "^${KEY}=" "$ENV_FILE" 2>/dev/null; then
+                sed -i "s|^${KEY}=.*|${KEY}=${VAL}|" "$ENV_FILE"
+              else
+                echo "${KEY}=${VAL}" >> "$ENV_FILE"
+              fi
+            }
+
+            upsert_env IMAGE_TAG "$NEW_TAG"
+
+            docker compose -f docker-compose.dev.yml pull $SERVICE
+            docker compose -f docker-compose.dev.yml up -d $SERVICE
+
+            echo "Health check 시작... (port: 9001)"
+            for i in $(seq 1 8); do
+              sleep 30
+              if curl -sf "http://localhost:9001/actuator/health" > /dev/null; then
+                echo "Health check 통과 (시도 $i)"
+                exit 0
+              fi
+              echo "Health check 실패 ($i/8)"
+            done
+
+            if [ -z "$PREV_TAG" ]; then
+              echo "이전 태그 없음 — 롤백 불가, 수동 복구 필요"
+              exit 1
+            fi
+            echo "배포 실패 — $PREV_TAG 로 롤백..."
+            upsert_env IMAGE_TAG "$PREV_TAG"
+            docker compose -f docker-compose.dev.yml up -d $SERVICE
+            sleep 30
+            curl -sf "http://localhost:9001/actuator/health" > /dev/null && echo "롤백 성공" || echo "롤백도 실패"
+            exit 1
+
+  # main 브랜치: 2 VM 병렬 배포 (eureka1 + eureka2)
+  deploy-prod-eureka1:
+    name: Deploy (prod - eureka1)
+    if: github.ref_name == 'main'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy compose file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ vars.VM_USER }}
+          port: ${{ vars.VM_SSH_PORT }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: "docker-compose.prod.yml"
+          target: "${{ vars.APP_DIR }}"
+
+      - name: Deploy eureka1
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ vars.VM_USER }}
+          port: ${{ vars.VM_SSH_PORT }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -e
+            APP_DIR="${{ vars.APP_DIR }}"
+            SERVICE="${{ vars.SERVICE_NAME }}"
+            NEW_TAG="${{ github.sha }}"
+            ENV_FILE="$APP_DIR/.env"
+
+            cd $APP_DIR
+
+            PREV_TAG=$(grep '^IMAGE_TAG=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)
+            if [ -z "$PREV_TAG" ]; then
+              echo "이전 태그 없음 — 초기 배포로 간주, 실패 시 롤백 불가"
+            fi
+            echo "Previous: ${PREV_TAG:-(없음)} → New: $NEW_TAG"
+
+            upsert_env() {
+              local KEY="$1" VAL="$2"
+              if grep -q "^${KEY}=" "$ENV_FILE" 2>/dev/null; then
+                sed -i "s|^${KEY}=.*|${KEY}=${VAL}|" "$ENV_FILE"
+              else
+                echo "${KEY}=${VAL}" >> "$ENV_FILE"
+              fi
+            }
+
+            upsert_env IMAGE_TAG "$NEW_TAG"
+            upsert_env SPRING_PROFILES_ACTIVE "eureka1"
+            upsert_env SERVER_PORT "9001"
+            upsert_env HOSTNAME1 "${{ secrets.VM_HOST }}"
+            upsert_env HOSTNAME2 "${{ secrets.VM_HOST }}"
+
+            docker compose -f docker-compose.prod.yml pull $SERVICE
+            docker compose -f docker-compose.prod.yml up -d $SERVICE
+
+            echo "Health check 시작... (port: 9001)"
+            for i in $(seq 1 8); do
+              sleep 30
+              if curl -sf "http://localhost:9001/actuator/health" > /dev/null; then
+                echo "Health check 통과 (시도 $i)"
+                exit 0
+              fi
+              echo "Health check 실패 ($i/8)"
+            done
+
+            if [ -z "$PREV_TAG" ]; then
+              echo "이전 태그 없음 — 롤백 불가, 수동 복구 필요"
+              exit 1
+            fi
+            echo "배포 실패 — $PREV_TAG 로 롤백..."
+            upsert_env IMAGE_TAG "$PREV_TAG"
+            docker compose -f docker-compose.prod.yml up -d $SERVICE
+            sleep 30
+            curl -sf "http://localhost:9001/actuator/health" > /dev/null && echo "롤백 성공" || echo "롤백도 실패"
+            exit 1
+
+  deploy-prod-eureka2:
+    name: Deploy (prod - eureka2)
+    if: github.ref_name == 'main'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy compose file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ vars.VM_USER }}
+          port: ${{ vars.VM_SSH_PORT }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: "docker-compose.prod.yml"
+          target: "${{ vars.APP_DIR }}"
+
+      - name: Deploy eureka2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ vars.VM_USER }}
+          port: ${{ vars.VM_SSH_PORT }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -e
+            APP_DIR="${{ vars.APP_DIR }}"
+            SERVICE="${{ vars.SERVICE_NAME }}"
+            NEW_TAG="${{ github.sha }}"
+            ENV_FILE="$APP_DIR/.env"
+
+            cd $APP_DIR
+
+            PREV_TAG=$(grep '^IMAGE_TAG=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)
+            if [ -z "$PREV_TAG" ]; then
+              echo "이전 태그 없음 — 초기 배포로 간주, 실패 시 롤백 불가"
+            fi
+            echo "Previous: ${PREV_TAG:-(없음)} → New: $NEW_TAG"
+
+            upsert_env() {
+              local KEY="$1" VAL="$2"
+              if grep -q "^${KEY}=" "$ENV_FILE" 2>/dev/null; then
+                sed -i "s|^${KEY}=.*|${KEY}=${VAL}|" "$ENV_FILE"
+              else
+                echo "${KEY}=${VAL}" >> "$ENV_FILE"
+              fi
+            }
+
+            upsert_env IMAGE_TAG "$NEW_TAG"
+            upsert_env SPRING_PROFILES_ACTIVE "eureka2"
+            upsert_env SERVER_PORT "9002"
+            upsert_env HOSTNAME1 "${{ secrets.VM_HOST }}"
+            upsert_env HOSTNAME2 "${{ secrets.VM_HOST }}"
+
+            docker compose -f docker-compose.prod.yml pull $SERVICE
+            docker compose -f docker-compose.prod.yml up -d $SERVICE
+
+            echo "Health check 시작... (port: 9002)"
+            for i in $(seq 1 8); do
+              sleep 30
+              if curl -sf "http://localhost:9002/actuator/health" > /dev/null; then
+                echo "Health check 통과 (시도 $i)"
+                exit 0
+              fi
+              echo "Health check 실패 ($i/8)"
+            done
+
+            if [ -z "$PREV_TAG" ]; then
+              echo "이전 태그 없음 — 롤백 불가, 수동 복구 필요"
+              exit 1
+            fi
+            echo "배포 실패 — $PREV_TAG 로 롤백..."
+            upsert_env IMAGE_TAG "$PREV_TAG"
+            docker compose -f docker-compose.prod.yml up -d $SERVICE
+            sleep 30
+            curl -sf "http://localhost:9002/actuator/health" > /dev/null && echo "롤백 성공" || echo "롤백도 실패"
+            exit 1

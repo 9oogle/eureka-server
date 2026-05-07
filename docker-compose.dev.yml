@@ -1,0 +1,17 @@
+# dev: 단일 인스턴스 (application.yaml 의 local 프로필 사용)
+services:
+  eureka-server:
+    image: asia-northeast3-docker.pkg.dev/melodic-crane-494802-u3/goggles/eureka-server:${IMAGE_TAG:-latest}
+    container_name: goggles-eureka-server
+    restart: unless-stopped
+    ports:
+      - "9001:9001"
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SERVER_PORT: "9001"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9001/actuator/health 2>/dev/null | grep -q UP || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 90s
