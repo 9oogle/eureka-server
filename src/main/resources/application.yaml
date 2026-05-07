@@ -6,6 +6,25 @@ spring:
 spring:
   config:
     activate:
+      on-profile: local
+
+server:
+  port: 9001
+
+eureka:
+  instance:
+    hostname: localhost
+    prefer-ip-address: false
+  client:
+    register-with-eureka: false
+    fetch-registry: false
+    service-url:
+      defaultZone: http://localhost:9001/eureka/
+
+---
+spring:
+  config:
+    activate:
       on-profile: eureka1
 
 server:
@@ -38,4 +57,4 @@ eureka:
     register-with-eureka: true
     fetch-registry: true
     service-url:
-      defaultZone: http://${hostname1:localhost}:9001/eureka/
+      defaultZone: http://${hostname1:eureka-peer1}:9001/eureka/
