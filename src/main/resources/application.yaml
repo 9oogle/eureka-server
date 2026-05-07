@@ -38,4 +38,4 @@ eureka:
     register-with-eureka: true
     fetch-registry: true
     service-url:
-      defaultZone: http://${hostname1:localhost}:9001/eureka/
+      defaultZone: http://${hostname1:eureka-peer1}:9001/eureka/
