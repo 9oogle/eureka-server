@@ -3,7 +3,7 @@
 # VM2: SPRING_PROFILES_ACTIVE=eureka2, HOSTNAME1=<vm1-ip>, HOSTNAME2=<vm2-ip>
 services:
   eureka-server:
-    image: asia-northeast3-docker.pkg.dev/melodic-crane-494802-u3/goggles/eureka-server:${IMAGE_TAG:-latest}
+    image: asia-northeast3-docker.pkg.dev/${GCP_PROJECT_ID}/goggles/eureka-server:${IMAGE_TAG:-latest}
     container_name: goggles-eureka-server
     restart: unless-stopped
     ports:

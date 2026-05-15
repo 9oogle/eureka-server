@@ -1,7 +1,7 @@
 # dev: 단일 인스턴스 (application.yaml 의 local 프로필 사용)
 services:
   eureka-server:
-    image: asia-northeast3-docker.pkg.dev/melodic-crane-494802-u3/goggles/eureka-server:${IMAGE_TAG:-latest}
+    image: asia-northeast3-docker.pkg.dev/${GCP_PROJECT_ID}/goggles/eureka-server:${IMAGE_TAG:-latest}
     container_name: goggles-eureka-server
     restart: unless-stopped
     ports:
@@ -16,3 +16,9 @@ services:
       timeout: 5s
       retries: 15
       start_period: 90s
+    networks:
+      - goggles-network
+
+networks:
+  goggles-network:
+    external: true

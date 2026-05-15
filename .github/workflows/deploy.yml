@@ -21,10 +21,12 @@ jobs:
         env:
           SECRET_VM_HOST: ${{ secrets.VM_HOST }}
           SECRET_VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          SECRET_GCP_PROJECT_NUMBER: ${{ secrets.GCP_PROJECT_NUMBER }}
         run: |
           echo "=== Variables ==="
           echo "GAR_LOCATION      : ${{ vars.GAR_LOCATION }}"
           echo "GCP_PROJECT_ID    : ${{ vars.GCP_PROJECT_ID }}"
+          echo "GCP_SA_EMAIL       : ${{ vars.GCP_SA_EMAIL }}"
           echo "GAR_REPOSITORY    : ${{ vars.GAR_REPOSITORY }}"
           echo "SERVICE_NAME      : ${{ vars.SERVICE_NAME }}"
           echo "VM_USER           : ${{ vars.VM_USER }}"
@@ -32,12 +34,14 @@ jobs:
           echo "APP_DIR           : ${{ vars.APP_DIR }}"
           echo ""
           echo "=== Secrets (존재 여부만 확인) ==="
-          [ -n "$SECRET_VM_HOST"    ] && echo "VM_HOST     : ✅" || echo "VM_HOST     : ❌ 누락"
-          [ -n "$SECRET_VM_SSH_KEY" ] && echo "VM_SSH_KEY  : ✅" || echo "VM_SSH_KEY  : ❌ 누락"
+          [ -n "$SECRET_VM_HOST"            ] && echo "VM_HOST            : ✅" || echo "VM_HOST            : ❌ 누락"
+          [ -n "$SECRET_VM_SSH_KEY"         ] && echo "VM_SSH_KEY         : ✅" || echo "VM_SSH_KEY         : ❌ 누락"
+          [ -n "$SECRET_GCP_PROJECT_NUMBER" ] && echo "GCP_PROJECT_NUMBER : ✅" || echo "GCP_PROJECT_NUMBER : ❌ 누락"
 
           MISSING=()
           [ -z "${{ vars.GAR_LOCATION }}"     ] && MISSING+=("vars.GAR_LOCATION")
           [ -z "${{ vars.GCP_PROJECT_ID }}"   ] && MISSING+=("vars.GCP_PROJECT_ID")
+          [ -z "${{ vars.GCP_SA_EMAIL }}"      ] && MISSING+=("vars.GCP_SA_EMAIL")
           [ -z "${{ vars.GAR_REPOSITORY }}"   ] && MISSING+=("vars.GAR_REPOSITORY")
           [ -z "${{ vars.SERVICE_NAME }}"     ] && MISSING+=("vars.SERVICE_NAME")
           [ -z "${{ vars.VM_USER }}"          ] && MISSING+=("vars.VM_USER")
@@ -45,6 +49,7 @@ jobs:
           [ -z "${{ vars.APP_DIR }}"          ] && MISSING+=("vars.APP_DIR")
           [ -z "$SECRET_VM_HOST"              ] && MISSING+=("secrets.VM_HOST")
           [ -z "$SECRET_VM_SSH_KEY"           ] && MISSING+=("secrets.VM_SSH_KEY")
+          [ -z "$SECRET_GCP_PROJECT_NUMBER"   ] && MISSING+=("secrets.GCP_PROJECT_NUMBER")
 
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "=== 누락된 변수 ==="
@@ -114,17 +119,21 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/985172684764/locations/global/workloadIdentityPools/github-pool/providers/github-provider-v2
-          service_account: deployManager@melodic-crane-494802-u3.iam.gserviceaccount.com
+          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider-v2
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ vars.GAR_LOCATION }}-docker.pkg.dev --quiet
+        run: |
+          gcloud auth configure-docker ${{ vars.GAR_LOCATION }}-docker.pkg.dev --quiet
+          
 
       - name: Build and push image
         run: |
-          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest-${{ github.ref_name }} .
+          LATEST_TAG=$([[ "${{ github.ref_name }}" == "main" ]] && echo "latest-main" || echo "latest-dev")
+          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:${LATEST_TAG} .
           docker push $IMAGE:${{ github.sha }}
-          docker push $IMAGE:latest-${{ github.ref_name }}
+          docker push $IMAGE:${LATEST_TAG}
 
   # dev 브랜치: 단일 VM, local 프로필
   deploy-dev:
